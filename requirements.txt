@@ -1,0 +1,5 @@
+mcp
+-r ../pg/requirements.txt
+-r ../aks/requirements.txt
+-r ../adx/requirements.txt
+-r ../eh/requirements.txt
