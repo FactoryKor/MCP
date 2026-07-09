@@ -44,7 +44,7 @@ Install File/            # = BASE (mcp_server.py 기준 상위 폴더)
 | `diagnose_postgres` | PostgreSQL Flexible Server | `host`, `dbname`, `resource_id`, `hours` | `pg_diagnose.py --aad --format json` |
 | `diagnose_aks` | AKS 클러스터 | `namespace`, `context`, `all_namespaces`, `prometheus_url`, `appinsights_id` | `aks_diagnose.py --format json` |
 | `diagnose_adx` | Azure Data Explorer(Kusto) | `cluster`, `database`, `resource_id`, `region`, `hours` | `adx_diagnose.py --auth default --format json` |
-| `diagnose_eventhub` | Azure Event Hubs | `resource_id`, `event_hub`, `window_minutes` | `eh_diagnose.py --azure-auth --eh-auth entra --format json` |
+| `diagnose_eventhub` | Azure Event Hubs | `resource_id`, `event_hub`, `region`, `window_minutes` | `eh_diagnose.py --azure-auth --eh-auth entra --format json` |
 
 각 도구는 입력을 검증(`RID`/`NS`/`CLUSTER` 정규식)한 뒤 `subprocess.run([... , "--format", "json"])`으로
 진단기를 실행하고 `json.loads(stdout)`을 반환합니다. 인자는 셸 문자열이 아닌 **argv 리스트**로 전달합니다.
@@ -54,7 +54,7 @@ Install File/            # = BASE (mcp_server.py 기준 상위 폴더)
 - 심각도 값: **critical / warning / info / ok** (※ high/medium/low 아님)
 - `pg` · `adx`: `findings[]` = severity / category / title / detail / recommendation
 - `aks`: severity / component / title / detail / recommendation / **steps(리스트)**
-- `eh`: 자체 스키마(`checks[]` = category / severity / title / detail / evidence, `worst_severity`)
+- `eh`: 자체 스키마(`checks[]` = category / severity / title / detail / **recommendation** / evidence) + 최상위 `worst_severity` / **`health_score`** / **`severity_counts`** / **`summary`**(자연어 한 줄) / **`recommended_actions[]`**(우선순위 조치: severity / category / title / action)
 
 ---
 
@@ -80,6 +80,83 @@ python mcp_server.py
 ```
 az acr build -r $ACR -t diag-mcp:v1 -f mcp/Dockerfile .   # BASE(Install File) 루트에서
 ```
+
+---
+
+## 배포 (CI/CD → ACR → ACA)
+
+> [!IMPORTANT]
+> **소스가 있는 곳(GitHub) ≠ 실행되는 곳(상주 MCP 서버)**.
+> GitHub는 **배포 시점에만** 개입한다: 이미지 빌드 → ACR 푸시(**버전 고정**) → ACA 재배포.
+> 런타임 요청 루프(SRE Agent → `/mcp` 호출 → 진단 실행 → JSON)에 GitHub는 **없다**.
+> 매 요청마다 clone/`pip install` 하지 않는다(지연·공급망·재현성·인증 문제 회피).
+
+```
+GitHub 리포(Install File/)
+   │  git push (main) / tag v1.2.0
+   ▼
+GitHub Actions (.github/workflows/deploy-mcp.yml)
+   │  az acr build  →  ACR: diag-mcp:<version> (버전 고정) + :latest
+   ▼
+Azure Container Apps 에 diag-mcp 상주  ← 진단 코드가 이미지에 이미 설치됨
+   ▲   (User-Assigned Managed Identity 로 ADX/PG/AKS/EH 읽기 전용 접근)
+   │  MCP 호출 (/mcp, streamable-http) — 매 요청
+SRE Agent  ←  사용자/인시던트 트리거
+```
+
+### 1. 인프라 프로비저닝 (Bicep)
+`infra/main.bicep` — Log Analytics + Container Apps 환경 + **User-Assigned Managed Identity** + Container App(포트 8000, `/mcp`) + ACR Pull role.
+
+```powershell
+az deployment group create -g <rg> `
+  -f infra/main.bicep -p infra/main.bicepparam `
+  -p acrName=<ACR 이름>
+# 출력: mcpEndpoint / identityPrincipalId / identityClientId
+```
+
+### 2. 최소 권한 부여 (읽기 전용)
+진단은 전부 read-only 이므로 MI 권한도 조회/메트릭 read 로 최소화한다.
+`infra` 출력의 `identityPrincipalId` 를 사용:
+
+```powershell
+./infra/assign-roles.ps1 -PrincipalId <identityPrincipalId> `
+  -MonitoringScope "/subscriptions/<sub>/resourceGroups/<rg>" `
+  -EventHubNamespaceId "<eh-namespace-resource-id>" `
+  -AksClusterId "<aks-resource-id>"
+```
+
+| 대상 | Azure RBAC(스크립트가 부여) | 데이터 평면(별도 부여) |
+|---|---|---|
+| 공통 | `Reader`, `Monitoring Reader` | — |
+| PostgreSQL | `Reader`/`Monitoring Reader` | MI를 Entra 사용자로 등록 후 `GRANT pg_monitor` |
+| ADX | `Reader`/`Monitoring Reader` | 데이터베이스 `Viewer`(또는 AllDatabasesViewer) |
+| Event Hubs | `Azure Event Hubs Data Receiver` | — |
+| AKS | `AKS Cluster User Role` | K8s RBAC `view` ClusterRole 바인딩 |
+
+> [!NOTE]
+> 데이터 평면 권한은 Azure RBAC가 아니라 각 서비스 내부에서 부여한다(스크립트 실행 후 안내 출력 참고).
+
+### 3. CI/CD (GitHub Actions)
+`.github/workflows/deploy-mcp.yml` — `main` 푸시/`v*` 태그 시 실행. **OIDC 로그인**(시크릿 없는 자격),
+`az acr build`(버전 고정 태그 = 릴리스 태그 또는 `sha-<short>`), `az containerapp update`.
+
+리포 시크릿(Settings → Secrets → Actions):
+
+| 시크릿 | 용도 |
+|---|---|
+| `AZURE_CLIENT_ID` / `AZURE_TENANT_ID` / `AZURE_SUBSCRIPTION_ID` | Azure OIDC 로그인용 앱(연합 자격) |
+| `ACR_NAME` | 이미지 빌드/보관 ACR |
+| `ACA_NAME` / `ACA_RESOURCE_GROUP` | 배포 대상 Container App |
+
+> 배포 승인 게이트가 필요하면 워크플로의 `environment: production` 에 보호 규칙을 건다.
+
+### 4. SRE Agent 커넥터 등록
+`infra` 출력 `mcpEndpoint`(`https://<fqdn>/mcp`)를 SRE Agent의 MCP 커넥터로 등록한다.
+
+> [!WARNING]
+> `externalIngress=true`(PoC 기본)는 MCP 엔드포인트를 공개한다. 운영에서는 `externalIngress=false`(내부)로
+> 두고 **APIM/Private Endpoint 뒤에 인증**을 두거나, 최소한 IP 제한을 건다. 진단 출력은 `_clean`으로
+> secret/PII/prompt-injection을 필터링하지만, 엔드포인트 자체 접근 제어는 별도로 확보해야 한다.
 
 ---
 
