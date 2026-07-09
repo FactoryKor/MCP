@@ -38,7 +38,7 @@ Install File/            # = BASE (parent folder of mcp_server.py)
 | `diagnose_postgres` | PostgreSQL Flexible Server | `host`, `dbname`, `resource_id`, `hours` | `pg_diagnose.py --aad --format json` |
 | `diagnose_aks` | AKS cluster | `namespace`, `context`, `all_namespaces`, `prometheus_url`, `appinsights_id` | `aks_diagnose.py --format json` |
 | `diagnose_adx` | Azure Data Explorer (Kusto) | `cluster`, `database`, `resource_id`, `region`, `hours` | `adx_diagnose.py --auth default --format json` |
-| `diagnose_eventhub` | Azure Event Hubs | `resource_id`, `event_hub`, `window_minutes` | `eh_diagnose.py --azure-auth --eh-auth entra --format json` |
+| `diagnose_eventhub` | Azure Event Hubs | `resource_id`, `event_hub`, `region`, `window_minutes` | `eh_diagnose.py --azure-auth --eh-auth entra --format json` |
 
 Each tool validates input (`RID` / `NS` / `CLUSTER` regex), then runs the diagnostic via `subprocess.run([..., "--format", "json"])` and returns `json.loads(stdout)`. Arguments are passed as an **argv list**, not a shell string.
 
@@ -47,7 +47,7 @@ Each tool validates input (`RID` / `NS` / `CLUSTER` regex), then runs the diagno
 - Severity values: **critical / warning / info / ok** (NOT high/medium/low)
 - `pg` · `adx`: `findings[]` = severity / category / title / detail / recommendation
 - `aks`: severity / component / title / detail / recommendation / **steps (list)**
-- `eh`: its own schema (`checks[]` = category / severity / title / detail / evidence, `worst_severity`)
+- `eh`: its own schema (`checks[]` = category / severity / title / detail / **recommendation** / evidence) plus top-level `worst_severity` / **`health_score`** / **`severity_counts`** / **`summary`** (one-line NL) / **`recommended_actions[]`** (prioritized: severity / category / title / action)
 
 ---
 
